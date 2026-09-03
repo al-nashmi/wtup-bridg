@@ -23,6 +23,9 @@ class Message:
     # Real phone number behind `sender` when the sender used WhatsApp's LID
     # (privacy) addressing. None when unknown or sender is already a number.
     sender_phone_number: Optional[str] = None
+    # Saved/synced contact name for the sender (full/first/push/business
+    # name, whichever whatsmeow had). None when unknown.
+    sender_name: Optional[str] = None
 
 @dataclass
 class Chat:
@@ -110,6 +113,10 @@ def format_message(message: Message, show_chat_info: bool = True) -> None:
     try:
         if message.is_from_me:
             sender_name = "Me"
+        elif message.sender_name:
+            # Resolved from whatsmeow's own contact/push-name cache - the
+            # most reliable source, works even when message.sender is a LID.
+            sender_name = message.sender_name
         else:
             sender_name = get_sender_name(message.sender)
             # message.sender is a LID (e.g. "123456@lid" -> stored as just
@@ -153,7 +160,7 @@ def list_messages(
         cursor = conn.cursor()
         
         # Build base query
-        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.sender_pn FROM messages"]
+        query_parts = ["SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.sender_pn, messages.sender_name FROM messages"]
         query_parts.append("JOIN chats ON messages.chat_jid = chats.jid")
         where_clauses = []
         params = []
@@ -212,7 +219,8 @@ def list_messages(
                 chat_jid=msg[5],
                 id=msg[6],
                 media_type=msg[7],
-                sender_phone_number=msg[8]
+                sender_phone_number=msg[8],
+                sender_name=msg[9]
             )
             result.append(message)
             
@@ -250,7 +258,7 @@ def get_message_context(
         
         # Get the target message first
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.sender_pn
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.chat_jid, messages.media_type, messages.sender_pn, messages.sender_name
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.id = ?
@@ -269,12 +277,13 @@ def get_message_context(
             chat_jid=msg_data[5],
             id=msg_data[6],
             media_type=msg_data[8],
-            sender_phone_number=msg_data[9]
+            sender_phone_number=msg_data[9],
+            sender_name=msg_data[10]
         )
 
         # Get messages before
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.sender_pn
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.sender_pn, messages.sender_name
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp < ?
@@ -293,12 +302,13 @@ def get_message_context(
                 chat_jid=msg[5],
                 id=msg[6],
                 media_type=msg[7],
-                sender_phone_number=msg[8]
+                sender_phone_number=msg[8],
+                sender_name=msg[9]
             ))
 
         # Get messages after
         cursor.execute("""
-            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.sender_pn
+            SELECT messages.timestamp, messages.sender, chats.name, messages.content, messages.is_from_me, chats.jid, messages.id, messages.media_type, messages.sender_pn, messages.sender_name
             FROM messages
             JOIN chats ON messages.chat_jid = chats.jid
             WHERE messages.chat_jid = ? AND messages.timestamp > ?
@@ -317,7 +327,8 @@ def get_message_context(
                 chat_jid=msg[5],
                 id=msg[6],
                 media_type=msg[7],
-                sender_phone_number=msg[8]
+                sender_phone_number=msg[8],
+                sender_name=msg[9]
             ))
         
         return MessageContext(
@@ -517,7 +528,8 @@ def get_last_interaction(jid: str) -> str:
                 c.jid,
                 m.id,
                 m.media_type,
-                m.sender_pn
+                m.sender_pn,
+                m.sender_name
             FROM messages m
             JOIN chats c ON m.chat_jid = c.jid
             WHERE m.sender = ? OR c.jid = ?
@@ -539,7 +551,8 @@ def get_last_interaction(jid: str) -> str:
             chat_jid=msg_data[5],
             id=msg_data[6],
             media_type=msg_data[7],
-            sender_phone_number=msg_data[8]
+            sender_phone_number=msg_data[8],
+            sender_name=msg_data[9]
         )
 
         return format_message(message)
