@@ -82,6 +82,7 @@ func NewMessageStore() (*MessageStore, error) {
 			file_enc_sha256 BLOB,
 			file_length INTEGER,
 			direct_path TEXT,
+			sender_pn TEXT,
 			PRIMARY KEY (id, chat_jid),
 			FOREIGN KEY (chat_jid) REFERENCES chats(jid)
 		);
@@ -91,11 +92,16 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
-	// Add direct_path to pre-existing databases that predate this column
-	_, err = db.Exec(`ALTER TABLE messages ADD COLUMN direct_path TEXT`)
-	if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
-		db.Close()
-		return nil, fmt.Errorf("failed to migrate messages table: %v", err)
+	// Add columns to pre-existing databases that predate them
+	for _, migration := range []string{
+		`ALTER TABLE messages ADD COLUMN direct_path TEXT`,
+		`ALTER TABLE messages ADD COLUMN sender_pn TEXT`,
+	} {
+		_, err = db.Exec(migration)
+		if err != nil && !strings.Contains(err.Error(), "duplicate column name") {
+			db.Close()
+			return nil, fmt.Errorf("failed to migrate messages table: %v", err)
+		}
 	}
 
 	return &MessageStore{db: db}, nil
@@ -117,7 +123,7 @@ func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time
 
 // Store a message in the database
 func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, timestamp time.Time, isFromMe bool,
-	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, directPath string) error {
+	mediaType, filename, url string, mediaKey, fileSHA256, fileEncSHA256 []byte, fileLength uint64, directPath, senderPN string) error {
 	// Only store if there's actual content or media
 	if content == "" && mediaType == "" {
 		return nil
@@ -125,11 +131,28 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 
 	_, err := store.db.Exec(
 		`INSERT OR REPLACE INTO messages
-		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, direct_path)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, directPath,
+		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length, direct_path, sender_pn)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength, directPath, senderPN,
 	)
 	return err
+}
+
+// resolveSenderPN returns the sender's real phone number when the message
+// used LID (privacy) addressing, or "" when the sender is already a phone
+// number or no mapping is known yet.
+func resolveSenderPN(client *whatsmeow.Client, sender, senderAlt types.JID) string {
+	if sender.Server != types.HiddenUserServer {
+		// Sender is already a phone number.
+		return sender.User
+	}
+	if !senderAlt.IsEmpty() {
+		return senderAlt.User
+	}
+	if pn, err := client.Store.LIDs.GetPNForLID(context.Background(), sender); err == nil && !pn.IsEmpty() {
+		return pn.User
+	}
+	return ""
 }
 
 // Get messages from a chat
@@ -421,6 +444,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
+	senderPN := resolveSenderPN(client, msg.Info.Sender, msg.Info.SenderAlt)
 
 	// Get appropriate chat name (pass nil for conversation since we don't have one for regular messages)
 	name := GetChatName(client, messageStore, msg.Info.Chat, chatJID, nil, sender, logger)
@@ -458,6 +482,7 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		fileEncSHA256,
 		fileLength,
 		directPath,
+		senderPN,
 	)
 
 	if err != nil {
@@ -1111,6 +1136,16 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					sender = jid.User
 				}
 
+				// Resolve the sender's real phone number when they're
+				// addressed by LID (history sync has no SenderAlt field,
+				// so fall back to whatever whatsmeow has already learned).
+				senderPN := ""
+				if isFromMe {
+					senderPN = client.Store.ID.User
+				} else if senderJID, err := types.ParseJID(sender); err == nil {
+					senderPN = resolveSenderPN(client, senderJID, types.EmptyJID)
+				}
+
 				// Store message
 				msgID := ""
 				if msg.Message.Key != nil && msg.Message.Key.ID != nil {
@@ -1140,6 +1175,7 @@ func handleHistorySync(client *whatsmeow.Client, messageStore *MessageStore, his
 					fileEncSHA256,
 					fileLength,
 					directPath,
+					senderPN,
 				)
 				if err != nil {
 					logger.Warnf("Failed to store history message: %v", err)
