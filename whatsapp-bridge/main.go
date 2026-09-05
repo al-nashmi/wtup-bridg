@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -847,7 +848,26 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	}()
 }
 
+// singleInstanceLock claims a local-only TCP port for the lifetime of the
+// process. A second bridge instance (e.g. a leftover process from a crashed
+// restart, or someone starting it manually while the scheduled task is
+// already running it) will fail to bind and exit immediately, instead of
+// opening a second WhatsApp session and knocking the first one offline with
+// a "stream replaced" conflict.
+func singleInstanceLock() net.Listener {
+	const lockAddr = "127.0.0.1:47212"
+	lock, err := net.Listen("tcp", lockAddr)
+	if err != nil {
+		fmt.Println("Another instance of the WhatsApp bridge is already running (lock port already in use). Exiting.")
+		os.Exit(1)
+	}
+	return lock
+}
+
 func main() {
+	lock := singleInstanceLock()
+	defer lock.Close()
+
 	// Set up logger
 	logger := waLog.Stdout("Client", "INFO", true)
 	logger.Infof("Starting WhatsApp client...")
